@@ -1,0 +1,345 @@
+version: "3.7"
+
+services:
+  kafka:
+    image: bitnami/kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker 
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CLUSTER_ID=1
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://${HOST_IP}:9092
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+    volumes:
+      - kafka-data:/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --list --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 60s
+      retries: 10
+    networks:
+      - elk
+  
+  kafdrop:
+    container_name: kafdrop
+    image: obsidiandynamics/kafdrop
+    ports:
+      - "8900:9000"
+    environment:
+      - KAFKA_BROKERCONNECT=${HOST_IP}:9092
+    depends_on:
+      - kafka 
+    networks:
+      - elk
+
+  elasticsearch:
+    image: elasticsearch:7.16.2
+    container_name: elasticsearch
+    restart: always
+    environment:
+      - xpack.security.enabled=true
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xmx300m -Xms300m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - elasticsearch-data-volume:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - elk
+
+  kibana:
+    container_name: kibana
+    image: kibana:7.16.2
+    restart: always
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    volumes:
+      - ./kibana:/usr/share/kibana/config
+    networks:
+      - elk
+
+  logstash:
+    container_name: logstash
+    env_file:
+      - .env
+    image: bitnami/logstash:latest
+    restart: always
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./:/logstash_dir
+    command: logstash -f /logstash_dir/logstash.conf
+    ports:
+      - "9600:9600"
+    networks:
+      - elk
+      
+  postgres:
+    image: postgres:16
+    container_name: airflow_postgres
+    environment:
+      - POSTGRES_USER=${postgresuser}
+      - POSTGRES_PASSWORD=${postgrespassword}  # Change in production!
+      - POSTGRES_DB=${postgresdbname}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - elk
+      
+  redis:
+    image: redis:7.2-alpine
+    container_name: airflow_redis
+    command: redis-server --requirepass ${redispassword} --save 60 1 --loglevel warning
+    environment:
+      - REDIS_PASSWORD=youssef
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "youssef", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - elk
+      
+  airflow-init:
+    image: gimsaito/airflou:latest
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${postgresuser}:${postgrespassword}@postgres/airflow
+    command: >
+      bash -c "
+      until airflow db check; do
+        echo 'Waiting for database...';
+        sleep 5;
+      done &&
+      airflow db init &&
+      airflow users create \
+        --username admin \
+        --password admin \
+        --firstname Admin \
+        --lastname User \
+        --role Admin \
+        --email admin@example.com
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - elk
+
+
+  airflow-webserver:
+    image: gimsaito/airflou:latest
+    container_name: airflow_webserver
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${postgresuser}:${postgrespassword}@postgres/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${redispassword}@redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://${postgresuser}:${postgrespassword}@postgres/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${webserverseckey}
+      - AIRFLOW__CORE__FERNET_KEY=${fernetkey}  
+      - AIRFLOW_CONN_SPARK_DEFAULT='spark://${HOST_IP}:7077?deploy-mode=client&spark_binary=spark-submit'      
+      - AIRFLOW__CORE__DONOT_PICKLE=false
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./:/app
+      - ./plugins:/opt/airflow/plugins
+    ports:
+      - "8080:8080"
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - elk
+
+  airflow-scheduler:
+    image: gimsaito/airflou:latest
+    container_name: airflow_scheduler
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${postgresuser}:${postgrespassword}@postgres/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${redispassword}@redis:6379/0
+      - AIRFLOW__SCHEDULER__SCHEDULE_AFTER_TASK_EXECUTION=false
+      - AIRFLOW__CORE__FERNET_KEY=${fernetkey} 
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./:/app
+      - ./plugins:/opt/airflow/plugins
+    command: scheduler
+    networks:
+      - elk
+
+  airflow-worker:
+    image: gimsaito/airflou:latest
+    container_name: airflow_worker
+    restart: unless-stopped
+    depends_on:
+      - airflow-scheduler
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${postgresuser}:${postgrespassword}@postgres/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${redispassword}@redis:6379/0
+      - AIRFLOW__CORE__FERNET_KEY=${fernetkey}
+      - AIRFLOW__CELERY__WORKER_CONCURRENCY=4  
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./:/app
+      - ./plugins:/opt/airflow/plugins
+    command: celery worker
+    networks:
+      - elk
+      
+  flower:
+    image: gimsaito/airflou:latest
+    container_name: airflow_flower
+    restart: unless-stopped
+    environment:
+      - AIRFLOW__CELERY__BROKER_URL=redis://:${redispassword}@redis:6379/0
+      - FLOWER_BROKER_API=redis://:${redispassword}@redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    command: >
+      bash -c "
+      echo 'Waiting for Redis...';
+      celery --broker=redis://:${redispassword}@redis:6379/0 flower "
+    networks:
+      - elk
+
+  spark-master:
+    image: bitnami/spark:3.5.0
+    container_name: spark-master
+    user: root
+    ports:
+      - 9090:8080
+      - 7077:7077
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_LOCAL_IP=spark-master
+    volumes:
+      - ./:/app
+      - spark-data:/data
+    networks:
+      - elk
+
+  spark-worker-1:
+    image: bitnami/spark:3.5.0
+    container_name: spark-worker-1
+    user: root
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_WORKER_CORES=2
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    volumes:
+      - ./:/app
+      - spark-data:/data
+    networks:
+      - elk
+      
+  spark-worker-2:
+    image: bitnami/spark:3.5.0
+    container_name: spark-worker-2
+    user: root
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_WORKER_CORES=1
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    volumes:
+      - ./:/app
+      - spark-data:/data
+    networks:
+      - elk
+      
+  spark-worker-3:
+    image: bitnami/spark:3.5.0
+    container_name: spark-worker-3
+    user: root
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_WORKER_CORES=1
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    volumes:
+      - ./:/app
+      - spark-data:/data
+    networks:
+      - elk
+
+volumes:
+  elasticsearch-data-volume:
+    driver: local
+  postgres-data:
+    driver: local
+  spark-data:
+    driver: local
+  kafka-data:
+    driver: local
+
+
+networks:
+  elk:
+    driver: bridge
